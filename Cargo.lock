@@ -5,8 +5,7 @@ version = 4
 [[package]]
 name = "accesskit"
 version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320"
+source = "git+https://github.com/POLARIS0824/accesskit.git?rev=3d7ab31fc7177661bc8a3ead8382a7630612d7e9#3d7ab31fc7177661bc8a3ead8382a7630612d7e9"
 dependencies = [
  "enumn",
  "uuid",
@@ -29,8 +28,7 @@ dependencies = [
 [[package]]
 name = "accesskit_consumer"
 version = "0.38.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d10a236f96f87d70732e44520046785431ef01d5bcd6b041317bfadd2f88245"
+source = "git+https://github.com/POLARIS0824/accesskit.git?rev=3d7ab31fc7177661bc8a3ead8382a7630612d7e9#3d7ab31fc7177661bc8a3ead8382a7630612d7e9"
 dependencies = [
  "accesskit",
  "hashbrown 0.16.1",
@@ -71,8 +69,7 @@ dependencies = [
 [[package]]
 name = "accesskit_windows"
 version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106c2b961215864d1c2e703ee63269c25c4e80a577ffb2c1017b9c17dcdf83a1"
+source = "git+https://github.com/POLARIS0824/accesskit.git?rev=3d7ab31fc7177661bc8a3ead8382a7630612d7e9#3d7ab31fc7177661bc8a3ead8382a7630612d7e9"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -5432,6 +5429,7 @@ dependencies = [
 name = "editor"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "aho-corasick",
  "anyhow",
  "assets",

@@ -1,3 +1,4 @@
+mod accessibility;
 mod header;
 mod mouse;
 
@@ -8481,7 +8482,47 @@ impl Element for EditorElement {
     type PrepaintState = EditorLayout;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        Some(ElementId::NamedChild(
+            std::sync::Arc::new(ElementId::View(self.editor.entity_id())),
+            match self.split_side {
+                Some(SplitSide::Left) => "uia-editor-left",
+                Some(SplitSide::Right) => "uia-editor-right",
+                None => "uia-editor",
+            }
+            .into(),
+        ))
+    }
+
+    fn a11y_role(&self) -> Option<accesskit::Role> {
+        Some(accesskit::Role::GenericContainer)
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        layout: &mut Self::PrepaintState,
+        builder: &mut gpui::A11ySubtreeBuilder,
+    ) {
+        let Some(document) = &layout.accessibility else {
+            return;
+        };
+        let parent = builder.synthetic_node_id("document-identity");
+        let Some(nodes) = document.build_nodes(parent) else {
+            return;
+        };
+        let node = builder.parent_node();
+        node.set_role(if matches!(&layout.mode, EditorMode::SingleLine) {
+            accesskit::Role::TextInput
+        } else {
+            accesskit::Role::MultilineTextInput
+        });
+        node.add_action(accesskit::Action::Focus);
+        if layout.accessibility_read_only {
+            node.set_read_only();
+        }
+        node.set_text_selection(nodes.selection);
+        for (id, node) in nodes.children {
+            builder.push_child(id, node);
+        }
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -8565,7 +8606,7 @@ impl Element for EditorElement {
 
     fn prepaint(
         &mut self,
-        _: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
@@ -8586,6 +8627,9 @@ impl Element for EditorElement {
             let focus_handle = self.editor.focus_handle(cx);
             window.set_view_id(self.editor.entity_id());
             window.set_focus_handle(&focus_handle, cx);
+            if let Some(global_id) = global_id {
+                window.set_a11y_focus_handle(global_id, &focus_handle);
+            }
         }
 
         let rem_size = self.rem_size(cx);
@@ -10037,7 +10081,49 @@ impl Element for EditorElement {
                         editor.last_horizontal_scrollbar_visible = visible_horizontal_scrollbar;
                     });
 
+                    let accessibility = if window.is_a11y_active() && !is_minimap {
+                        self.editor.update(cx, |editor, cx| {
+                            let snapshot = &position_map.snapshot.display_snapshot;
+                            if !editor
+                                .redacted_ranges(Anchor::Min..Anchor::Max, snapshot, cx)
+                                .is_empty()
+                            {
+                                return None;
+                            }
+                            let source = snapshot.buffer_snapshot().text();
+                            let selection = editor.selections.newest::<MultiBufferOffset>(snapshot);
+                            let mut clip = position_map.text_hitbox.bounds;
+                            clip.origin.y += sticky_header_height;
+                            clip.size.height =
+                                (clip.size.height - sticky_header_height).max(px(0.));
+                            clip = clip.intersect(&position_map.text_hitbox.content_mask.bounds);
+                            let head = SelectionLayout::new(
+                                selection.clone(),
+                                editor.selections.line_mode(),
+                                editor.cursor_offset_on_selection,
+                                editor.cursor_shape,
+                                snapshot,
+                                true,
+                                true,
+                                None,
+                            )
+                            .head;
+                            Some(position_map.accessibility_document(
+                                source,
+                                selection.tail().0,
+                                selection.head().0,
+                                Some(head),
+                                window.scale_factor(),
+                                clip,
+                            ))
+                        })
+                    } else {
+                        None
+                    };
+
                     EditorLayout {
+                        accessibility,
+                        accessibility_read_only: is_read_only,
                         mode,
                         position_map,
                         visible_display_row_range: start_row..end_row,
@@ -10259,6 +10345,8 @@ impl IntoElement for EditorElement {
 }
 
 pub struct EditorLayout {
+    accessibility: Option<accessibility::Document>,
+    accessibility_read_only: bool,
     position_map: Rc<PositionMap>,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
@@ -10834,6 +10922,222 @@ impl PointForPosition {
 }
 
 impl PositionMap {
+    fn accessibility_document(
+        &self,
+        text: String,
+        anchor: usize,
+        focus: usize,
+        focus_point: Option<DisplayPoint>,
+        scale: f32,
+        clip: Bounds<Pixels>,
+    ) -> accessibility::Document {
+        let snapshot = &self.snapshot.display_snapshot;
+        let mut converter = snapshot.display_point_converter();
+        let mut folds = snapshot
+            .folds_in_range(MultiBufferOffset(0)..MultiBufferOffset(text.len()))
+            .map(|fold| {
+                fold.range.start.to_offset(snapshot.buffer_snapshot())
+                    ..fold.range.end.to_offset(snapshot.buffer_snapshot())
+            })
+            .peekable();
+        let first_row = self.visible_row_range.start.min(snapshot.max_point().row());
+        let visible_start = DisplayPoint::new(first_row, 0)
+            .to_offset(snapshot, Bias::Left)
+            .0;
+        let visible_end = if self.visible_row_range.end > snapshot.max_point().row() {
+            snapshot.max_point()
+        } else {
+            DisplayPoint::new(self.visible_row_range.end, 0)
+        }
+        .to_offset(snapshot, Bias::Right)
+        .0;
+        let mut runs = Vec::new();
+        let mut mapped = Vec::new();
+        let mut source_start = 0;
+        let mut focus_run = None;
+        let mut hidden_characters = 0;
+        let mut previous_in_clip = None;
+        let mut push = |source: Range<usize>, mapped: &mut Vec<Range<DisplayPoint>>| {
+            let index = runs.len();
+            let run = self.accessibility_run(source.clone(), mapped, scale, clip);
+            if let Some(point) = focus_point {
+                if source.start <= focus && focus <= source.end {
+                    if let Some(prefix) = text.get(source.start..focus) {
+                        let character = prefix.graphemes(true).count();
+                        if mapped
+                            .get(character)
+                            .is_some_and(|range| range.start == point)
+                            || character
+                                .checked_sub(1)
+                                .and_then(|index| mapped.get(index))
+                                .is_some_and(|range| range.end == point)
+                        {
+                            focus_run = Some(index);
+                        }
+                    }
+                }
+            }
+            runs.push(run);
+            mapped.clear();
+        };
+        for (offset, character) in text.grapheme_indices(true) {
+            let end = offset + character.len();
+            while folds.peek().is_some_and(|fold| fold.end.0 <= offset) {
+                folds.next();
+            }
+            let folded = folds.peek().is_some_and(|fold| fold.start.0 < end);
+            let range = (offset >= visible_start && offset < visible_end && !folded)
+                .then(|| converter.map(MultiBufferOffset(offset)..MultiBufferOffset(end)))
+                .filter(|ranges| ranges.len() == 1)
+                .and_then(|ranges| ranges.into_iter().next())
+                .filter(|range| {
+                    range.start.to_offset(snapshot, Bias::Left).0 == offset
+                        && range.end.to_offset(snapshot, Bias::Left).0 == end
+                });
+            let Some(mut range) = range else {
+                if !mapped.is_empty() {
+                    push(source_start..offset, &mut mapped);
+                    source_start = offset;
+                }
+                hidden_characters += 1;
+                if hidden_characters == 255 || character.ends_with('\n') {
+                    push(source_start..end, &mut mapped);
+                    source_start = end;
+                    hidden_characters = 0;
+                }
+                previous_in_clip = None;
+                continue;
+            };
+            if hidden_characters > 0 {
+                push(source_start..offset, &mut mapped);
+                source_start = offset;
+                hidden_characters = 0;
+            }
+            if range.end.row() != range.start.row() {
+                range.end =
+                    DisplayPoint::new(range.start.row(), snapshot.line_len(range.start.row()));
+            }
+            let in_clip = self.accessibility_point_in_clip(range.start, clip);
+            if !mapped.is_empty()
+                && (mapped.len() == 255
+                    || previous_in_clip != Some(in_clip)
+                    || mapped
+                        .last()
+                        .is_some_and(|previous: &Range<DisplayPoint>| previous.end != range.start)
+                    || mapped[0].start.row() != range.start.row())
+            {
+                push(source_start..offset, &mut mapped);
+                source_start = offset;
+            }
+            mapped.push(range);
+            previous_in_clip = Some(in_clip);
+        }
+        if source_start < text.len() {
+            push(source_start..text.len(), &mut mapped);
+        }
+        if text.len() >= visible_start && text.len() <= visible_end {
+            let end = MultiBufferOffset(text.len()).to_display_point(snapshot);
+            mapped.push(end..end);
+        }
+        push(text.len()..text.len(), &mut mapped);
+        if focus_point.is_some() && focus_run.is_none() {
+            if let Some((index, run)) = runs
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find(|(_, run)| run.source.start <= focus && focus <= run.source.end)
+            {
+                run.geometry = None;
+                focus_run = Some(index);
+            }
+        }
+        accessibility::Document {
+            text,
+            anchor,
+            focus,
+            focus_run,
+            runs,
+        }
+    }
+
+    fn accessibility_point_in_clip(&self, point: DisplayPoint, clip: Bounds<Pixels>) -> bool {
+        let Some(index) = point.row().0.checked_sub(self.visible_row_range.start.0) else {
+            return false;
+        };
+        let Some(line) = self.line_layouts.get(index as usize) else {
+            return false;
+        };
+        let x = self.content_origin.x + line.alignment_offset(self.text_align, self.content_width)
+            - Pixels::from(self.scroll_pixel_position.x)
+            + line.x_for_index(point.column() as usize);
+        x >= clip.left() && x <= clip.right()
+    }
+
+    fn accessibility_run(
+        &self,
+        source: Range<usize>,
+        mapped: &[Range<DisplayPoint>],
+        scale: f32,
+        clip: Bounds<Pixels>,
+    ) -> accessibility::Run {
+        let display_row = mapped.first().map(|range| range.start.row().0);
+        let geometry = (|| {
+            let row = mapped.first()?.start.row();
+            let index = row.0.checked_sub(self.visible_row_range.start.0)?;
+            let line = self.line_layouts.get(index as usize)?;
+            if mapped.iter().any(|range| {
+                range.start.row() != row
+                    || range.end.row() != row
+                    || range.start.column() as usize > line.len
+                    || range.end.column() as usize > line.len
+            }) {
+                return None;
+            }
+            let origin_x = self.content_origin.x
+                + line.alignment_offset(self.text_align, self.content_width)
+                - Pixels::from(self.scroll_pixel_position.x);
+            let top = self.content_origin.y
+                + Pixels::from(
+                    row.0 as f64 * ScrollPixelOffset::from(self.line_height)
+                        - self.scroll_pixel_position.y,
+                );
+            let left = origin_x + line.x_for_index(mapped.first()?.start.column() as usize);
+            let right = origin_x + line.x_for_index(mapped.last()?.end.column() as usize);
+            if left < clip.left()
+                || left > clip.right()
+                || top >= clip.bottom()
+                || top + self.line_height <= clip.top()
+            {
+                return None;
+            }
+            let mut positions = Vec::new();
+            let mut widths = Vec::new();
+            if !source.is_empty() {
+                for range in mapped {
+                    let x = origin_x + line.x_for_index(range.start.column() as usize);
+                    let next = (origin_x + line.x_for_index(range.end.column() as usize))
+                        .min(clip.right());
+                    positions.push(f32::from(x - left) * scale);
+                    widths.push(f32::from(next - x) * scale);
+                }
+            }
+            Some(accessibility::Geometry {
+                bounds: accesskit::Rect::new(
+                    (f32::from(left) * scale) as f64,
+                    (f32::from(top.max(clip.top())) * scale) as f64,
+                    (f32::from(right.min(clip.right())) * scale) as f64,
+                    (f32::from((top + self.line_height).min(clip.bottom())) * scale) as f64,
+                ),
+                positions,
+                widths,
+            })
+        })();
+        accessibility::Run {
+            source,
+            geometry,
+            display_row,
+        }
+    }
     pub(crate) fn inlay_hint_glyph_for_position(
         &self,
         position: gpui::Point<Pixels>,
@@ -11871,6 +12175,250 @@ mod tests {
             display_point(10)..display_point(11)
         );
         assert_eq!(vim_reversed_at_right_anchored_inlay.head, display_point(10));
+    }
+
+    #[gpui::test]
+    fn test_accessibility_character_navigation_matches_editor(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("é👩‍💻🇺🇸\n", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|window, cx| {
+            window.set_a11y_active_for_test(true);
+            editor.update(cx, |editor, cx| editor.style(cx).clone())
+        });
+        for expected in [3, 14, 22, 23] {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.move_right(&crate::actions::MoveRight, window, cx);
+                })
+            });
+            let (_, state) = cx.draw(Default::default(), size(px(300.), px(100.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
+            let document = state
+                .accessibility
+                .expect("cluster caret remains accessible");
+            assert_eq!(document.focus, expected);
+            let nodes = document
+                .build_nodes(accesskit::NodeId(1))
+                .expect("valid cluster positions");
+            assert!(
+                nodes
+                    .children
+                    .iter()
+                    .find(|(id, _)| *id == nodes.selection.focus.node)
+                    .expect("focus run")
+                    .1
+                    .bounds()
+                    .is_some(),
+                "visible cluster caret has geometry"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_accessibility_unicode_endpoints_and_deactivation(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for text in ["", "x", "x\n", "a😀é雪\n"] {
+            let window = cx.add_window(|window, cx| {
+                let buffer = MultiBuffer::build_simple(text, cx);
+                Editor::new(EditorMode::full(), buffer, None, window, cx)
+            });
+            let cx = &mut VisualTestContext::from_window(*window, cx);
+            let editor = window.root(cx).unwrap();
+            let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+            let (_, inactive) = cx.draw(Default::default(), size(px(300.), px(100.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
+            assert!(inactive.accessibility.is_none());
+            cx.update(|window, cx| {
+                window.set_a11y_active_for_test(true);
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([
+                                MultiBufferOffset(text.len())..MultiBufferOffset(0)
+                            ]);
+                        },
+                    );
+                });
+            });
+            let (_, active) = cx.draw(Default::default(), size(px(300.), px(100.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
+            let document = active
+                .accessibility
+                .expect("activated editor exports logical text");
+            assert_eq!(document.text, text);
+            assert_eq!((document.anchor, document.focus), (text.len(), 0));
+            let nodes = document
+                .build_nodes(accesskit::NodeId(1))
+                .expect("valid selection endpoints");
+            let exported: String = nodes
+                .children
+                .iter()
+                .filter_map(|(_, node)| node.value())
+                .collect();
+            assert_eq!(exported, text);
+            assert_eq!(nodes.selection.focus.character_index, 0);
+            assert!(
+                nodes
+                    .children
+                    .iter()
+                    .find(|(id, _)| *id == nodes.selection.focus.node)
+                    .unwrap()
+                    .1
+                    .bounds()
+                    .is_some()
+            );
+            cx.update(|window, _| window.set_a11y_active_for_test(false));
+            let (_, deactivated) = cx.draw(Default::default(), size(px(300.), px(100.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
+            assert!(deactivated.accessibility.is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn test_accessibility_partial_clip_retains_visible_caret(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("abc\ndef", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let (_, state) = cx.draw(Default::default(), size(px(300.), px(100.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        let map = state.position_map;
+        let mut clip = map.text_hitbox.bounds;
+        clip.origin.y = map.content_origin.y + px(1.);
+        clip.size.height = map.line_height * 2. - px(2.);
+        let document = map.accessibility_document("abc\ndef".into(), 1, 1, None, 1., clip);
+        assert!(
+            document.runs.iter().any(|run| run.geometry.is_some()),
+            "partly clipped visible text retains geometry"
+        );
+        let first = document.runs.first().unwrap().geometry.as_ref().unwrap();
+        let last = document
+            .runs
+            .iter()
+            .rev()
+            .find(|run| !run.source.is_empty())
+            .unwrap()
+            .geometry
+            .as_ref()
+            .unwrap();
+        assert_eq!(first.bounds.y0, f64::from(f32::from(clip.top())));
+        assert_eq!(last.bounds.y1, f64::from(f32::from(clip.bottom())));
+    }
+
+    #[gpui::test]
+    fn test_accessibility_preserves_large_document_and_transformed_layout(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let text = format!(
+            "a\tb {}\n{}",
+            "word ".repeat(30),
+            format!("{}\n", "tail ".repeat(112)).repeat(128)
+        );
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
+            editor
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        cx.update(|window, _| window.set_a11y_active_for_test(true));
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let (_, state) = cx.draw(Default::default(), size(px(200.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        let document = state
+            .accessibility
+            .expect("large transformed document remains accessible");
+        assert_eq!(document.text, text);
+        assert!(document.build_nodes(accesskit::NodeId(1)).is_some());
+        assert!(
+            document.runs.iter().any(|run| run.geometry.is_some()),
+            "visible wrapped text has geometry"
+        );
+        let advance = |offset| {
+            let run = document
+                .runs
+                .iter()
+                .find(|run| run.source.contains(&offset))
+                .unwrap();
+            let index = document.text[run.source.start..offset].chars().count();
+            run.geometry
+                .as_ref()
+                .expect("visible character has geometry")
+                .widths[index]
+        };
+        assert!(advance(1) > advance(0), "tab uses its rendered advance");
+        let first = document
+            .runs
+            .iter()
+            .find(|run| run.source.contains(&0))
+            .unwrap()
+            .geometry
+            .as_ref()
+            .unwrap();
+        let wrapped = document
+            .runs
+            .iter()
+            .find(|run| run.source.contains(&100))
+            .unwrap()
+            .geometry
+            .as_ref()
+            .expect("wrapped source character has geometry");
+        assert!(
+            wrapped.bounds.y0 > first.bounds.y0,
+            "one source row maps to multiple display rows"
+        );
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([
+                        MultiBufferOffset(text.len())..MultiBufferOffset(text.len())
+                    ]);
+                });
+            })
+        });
+        let (_, offscreen) = cx.draw(Default::default(), size(px(200.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        let offscreen = offscreen
+            .accessibility
+            .expect("offscreen selection keeps its document");
+        assert_eq!(offscreen.text, text);
+        assert_eq!(
+            (offscreen.anchor, offscreen.focus),
+            (text.len(), text.len())
+        );
+        let nodes = offscreen
+            .build_nodes(accesskit::NodeId(1))
+            .expect("queryable offscreen selection");
+        assert!(
+            nodes
+                .children
+                .iter()
+                .find(|(id, _)| *id == nodes.selection.focus.node)
+                .unwrap()
+                .1
+                .bounds()
+                .is_none()
+        );
+        assert!(offscreen.runs.iter().any(|run| run.geometry.is_some()));
     }
 
     #[gpui::test]
