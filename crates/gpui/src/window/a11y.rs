@@ -213,6 +213,11 @@ impl A11y {
         self.active_this_frame = self.is_enabled() && self.active_flag.load(Ordering::SeqCst);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_active_for_test(&mut self, active: bool) {
+        self.active_flag.store(active, Ordering::SeqCst);
+    }
+
     pub(crate) fn is_enabled(&self) -> bool {
         !self.force_disabled
     }
@@ -252,6 +257,21 @@ impl A11y {
             if let Some(focus_id) = self.focus_ids.get(&node_id).copied() {
                 self.note_focus_without_node(focus_id, "it has an id but no role");
             }
+        }
+    }
+
+    pub(crate) fn set_custom_element_focus(&mut self, node_id: NodeId, focus_id: FocusId) {
+        if self.nodes.focus_is_ancestor_of_current()
+            && self
+                .nodes
+                .focus
+                .and_then(|ancestor| self.focus_ids.get(&ancestor))
+                .copied()
+                == Some(focus_id)
+        {
+            self.set_active_descendant(node_id);
+        } else {
+            self.set_focus(node_id);
         }
     }
 
@@ -820,6 +840,57 @@ mod tests {
         let mut builder = new_builder();
         builder.set_focus(NodeId(1));
         builder.set_focus(NodeId(2));
+    }
+
+    #[test]
+    fn custom_element_focus_uses_same_handle_ancestor() {
+        let mut a11y = new_a11y();
+        let parent = NodeId(1);
+        let child = NodeId(2);
+        let focus = FocusId::default();
+        assert!(a11y.nodes.push(parent, test_node()));
+        a11y.set_focusable(parent, focus);
+        a11y.set_focus(parent);
+        assert!(a11y.nodes.push(child, test_node()));
+        a11y.set_focusable(child, focus);
+        a11y.set_custom_element_focus(child, focus);
+        assert_eq!(a11y.nodes.focus, Some(parent));
+        assert_eq!(a11y.nodes.active_descendant, Some(child));
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "set_focus called more than once")
+    )]
+    fn custom_element_focus_does_not_hide_unrelated_duplicate() {
+        let mut a11y = new_a11y();
+        let focus = FocusId::default();
+        assert!(a11y.nodes.push(NodeId(1), test_node()));
+        a11y.set_focusable(NodeId(1), focus);
+        a11y.set_focus(NodeId(1));
+        a11y.nodes.pop();
+        assert!(a11y.nodes.push(NodeId(2), test_node()));
+        a11y.set_focusable(NodeId(2), focus);
+        a11y.set_custom_element_focus(NodeId(2), focus);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "set_focus called more than once")
+    )]
+    fn custom_element_focus_does_not_hide_different_handle() {
+        let mut handles = slotmap::SlotMap::<FocusId, ()>::with_key();
+        let first = handles.insert(());
+        let second = handles.insert(());
+        let mut a11y = new_a11y();
+        assert!(a11y.nodes.push(NodeId(1), test_node()));
+        a11y.set_focusable(NodeId(1), first);
+        a11y.set_focus(NodeId(1));
+        assert!(a11y.nodes.push(NodeId(2), test_node()));
+        a11y.set_focusable(NodeId(2), second);
+        a11y.set_custom_element_focus(NodeId(2), second);
     }
 
     // Focusing a node that was never registered as focusable is a bug: panic in

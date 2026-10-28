@@ -5371,6 +5371,23 @@ impl Window {
         self.next_frame.dispatch_tree.set_key_context(context);
     }
 
+    /// Associates a custom element with its existing keyboard focus handle.
+    pub fn set_a11y_focus_handle(
+        &mut self,
+        global_id: &GlobalElementId,
+        focus_handle: &FocusHandle,
+    ) {
+        self.invalidator.debug_assert_prepaint();
+        if !self.a11y.is_active() {
+            return;
+        }
+        let node_id = global_id.accesskit_node_id();
+        self.a11y.set_focusable(node_id, focus_handle.id);
+        if focus_handle.is_focused(self) {
+            self.a11y.set_custom_element_focus(node_id, focus_handle.id);
+        }
+    }
+
     /// Sets the focus handle for the current element. This handle will be used to manage focus state
     /// and keyboard event dispatch for the element.
     ///
@@ -7077,6 +7094,13 @@ impl Window {
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     pub fn is_a11y_active(&self) -> bool {
         self.a11y.is_active()
+    }
+
+    /// Simulates an assistive technology client connecting or disconnecting in tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_a11y_active_for_test(&mut self, active: bool) {
+        self.a11y.set_active_for_test(active);
+        self.refresh();
     }
 
     /// Debug representation of the last frame's accessibility information.

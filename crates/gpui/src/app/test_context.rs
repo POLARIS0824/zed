@@ -1043,23 +1043,43 @@ impl VisualTestContext {
         E: Element,
     {
         self.update(|window, cx| {
-            let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+            let view_id = window
+                .root
+                .as_ref()
+                .expect("test window has a root view")
+                .entity_id();
+            window.with_rendered_view(view_id, |window| {
+                let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
-            window.invalidator.set_phase(DrawPhase::Prepaint);
-            let mut element = Drawable::new(f(window, cx));
-            element.layout_as_root(space.into(), window, cx);
-            window.with_absolute_element_offset(origin, |window| element.prepaint(window, cx));
+                window.a11y.sync_active_flag();
+                if window.a11y.is_active() {
+                    window.a11y.begin_frame();
+                }
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+                let mut element = Drawable::new(f(window, cx));
+                element.layout_as_root(space.into(), window, cx);
+                window.with_absolute_element_offset(origin, |window| element.prepaint(window, cx));
 
-            window.invalidator.set_phase(DrawPhase::Paint);
-            let (request_layout_state, prepaint_state) = element.paint(window, cx);
+                window.invalidator.set_phase(DrawPhase::Paint);
+                let (request_layout_state, prepaint_state) = element.paint(window, cx);
+                if window.a11y.is_active() {
+                    window
+                        .a11y
+                        .end_frame(crate::window::a11y::debug::FrameDebugInfo {
+                            viewport_size: window.viewport_size,
+                            scale_factor: window.scale_factor(),
+                            tab_stop_count: window.next_frame.tab_stops.tab_stop_count(),
+                        });
+                }
 
-            window.invalidator.set_phase(DrawPhase::None);
-            window.refresh();
+                window.invalidator.set_phase(DrawPhase::None);
+                window.refresh();
 
-            drop(element);
-            arena_scope.exit(&cx.element_arena).clear(cx);
+                drop(element);
+                arena_scope.exit(&cx.element_arena).clear(cx);
 
-            (request_layout_state, prepaint_state)
+                (request_layout_state, prepaint_state)
+            })
         })
     }
 
