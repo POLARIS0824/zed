@@ -11,7 +11,8 @@ use std::{cell::RefCell, path::Path};
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
     SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
-    SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation, decode_path_escapes,
+    SessionMessageSide, SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation,
+    decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -55,40 +56,10 @@ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
-use super::subagent_card::{SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card};
+use super::subagent_card::{
+    AcpSubagentCard, SubagentCardId, SubagentCardState, SubagentStatus, acp_subagent_card,
+};
 use super::*;
-
-/// Which side of a session message a transcript shows, and the other participant when it
-/// is known.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SessionMessageSide<'a> {
-    Outgoing {
-        recipient: Option<&'a acp_v2::SessionId>,
-    },
-    Incoming {
-        sender: Option<&'a acp_v2::SessionId>,
-    },
-    Unknown,
-}
-
-/// The transcript's own session is always one participant, so a single known participant
-/// that is another session also tells the direction.
-pub(super) fn session_message_side<'a>(
-    message: &'a acp_thread::SessionMessage,
-    own_session_id: &acp_v2::SessionId,
-) -> SessionMessageSide<'a> {
-    let sender = message.sender_session_id.as_ref();
-    let recipient = message.recipient_session_id.as_ref();
-    if sender == Some(own_session_id) {
-        SessionMessageSide::Outgoing { recipient }
-    } else if recipient == Some(own_session_id) || sender.is_some() {
-        SessionMessageSide::Incoming { sender }
-    } else if recipient.is_some() {
-        SessionMessageSide::Outgoing { recipient }
-    } else {
-        SessionMessageSide::Unknown
-    }
-}
 
 /// How a parent's view names a subagent. An ACP parent's own title for the subagent
 /// describes it in that view, so it wins over the subagent's title for itself.
@@ -2165,7 +2136,7 @@ impl ThreadView {
                     .read()
                     .available_commands()
                     .iter()
-                    .any(|available_command| available_command.name == "logout");
+                    .any(|available_command| available_command.name() == "logout");
             if can_login && !logout_supported {
                 message_editor.update(cx, |editor, cx| editor.clear(window, cx));
                 self.clear_external_source_prompt_warning(cx);
@@ -5236,10 +5207,11 @@ impl ThreadView {
             return false;
         };
 
-        // An ACP subagent reports its own outcome; a native one's is its parent's tool call.
+        // A subagent that reports its own state shows that. Otherwise, as for a native
+        // subagent saved before it recorded outcomes, its outcome is its parent's tool call.
         let thread = self.thread.read(cx);
-        if thread.subagent_association().is_some() {
-            return SubagentCardState::from_acp_subagent(thread)
+        if thread.subagent_association().is_some() && thread.has_received_session_state() {
+            return SubagentCardState::from_acp_subagent(thread, None)
                 .status
                 .is_failed_or_canceled();
         }
@@ -7561,10 +7533,8 @@ impl ThreadView {
             }
             AgentThreadEntry::SessionMessage(message) => {
                 let session_message =
-                    match acp_subagent_card(self.thread.read(cx), entry_ix, message) {
-                        Some((card_id, subagent)) => {
-                            self.render_acp_subagent_card(entry_ix, &card_id, &subagent, window, cx)
-                        }
+                    match acp_subagent_card(self.thread.read(cx), entry_ix, message, cx) {
+                        Some(card) => self.render_acp_subagent_card(entry_ix, &card, window, cx),
                         None => self.render_session_message(entry_ix, message, window, cx),
                     };
                 if let Some(handle) = self
@@ -8148,6 +8118,14 @@ impl ThreadView {
 
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to_end();
+        cx.notify();
+    }
+
+    pub(crate) fn scroll_to_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        self.list_state.scroll_to(ListOffset {
+            item_ix: entry_ix,
+            offset_in_item: px(0.),
+        });
         cx.notify();
     }
 
@@ -8910,7 +8888,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> Div {
         let own_session_id = self.thread.read(cx).session_id().clone();
-        let (icon, direction, participant) = match session_message_side(message, &own_session_id) {
+        let (icon, direction, participant) = match message.side(&own_session_id) {
             SessionMessageSide::Outgoing { recipient } => (IconName::Send, "To", recipient),
             SessionMessageSide::Incoming { sender } => (IconName::Envelope, "From", sender),
             SessionMessageSide::Unknown => (IconName::Envelope, "Message between sessions", None),
@@ -8926,11 +8904,12 @@ impl ThreadView {
                             .on_click(cx.listener({
                                 let session_id = session_id.clone();
                                 move |this, _, window, cx| {
-                                    this.server_view
-                                        .update(cx, |view, cx| {
-                                            view.navigate_to_thread(session_id.clone(), window, cx)
-                                        })
-                                        .log_err();
+                                    this.open_session_message_participant(
+                                        entry_ix,
+                                        &session_id,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             })),
                     )
@@ -8972,12 +8951,12 @@ impl ThreadView {
     fn render_acp_subagent_card(
         &self,
         entry_ix: usize,
-        card_id: &SubagentCardId,
-        subagent: &Entity<AcpThread>,
+        card: &AcpSubagentCard,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let subagent_session_id = subagent.read(cx).session_id().clone();
+        let subagent = card.subagent.read(cx);
+        let subagent_session_id = subagent.session_id().clone();
         let subagent_thread_view = self
             .server_view
             .upgrade()
@@ -8986,8 +8965,8 @@ impl ThreadView {
         let content = self.render_subagent_card(
             self.thread.read(cx).session_id(),
             entry_ix,
-            card_id,
-            &SubagentCardState::from_acp_subagent(subagent.read(cx)),
+            &card.id,
+            &SubagentCardState::from_acp_subagent(subagent, card.entries),
             subagent_thread_view,
             &self.focus_handle(cx),
             window,
@@ -9002,6 +8981,41 @@ impl ThreadView {
             .child(content)
     }
 
+    /// Opens the other participant of the session message at `entry_ix`, at its view of the
+    /// message when the two views are linked.
+    fn open_session_message_participant(
+        &mut self,
+        entry_ix: usize,
+        session_id: &acp_v2::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(server_view) = self.server_view.upgrade() else {
+            return;
+        };
+        let participant_view = server_view.read(cx).thread_view(session_id);
+        let thread = self.thread.read(cx);
+        let linked_entry_ix = participant_view.as_ref().and_then(|participant_view| {
+            let Some(AgentThreadEntry::SessionMessage(message)) = thread.entries().get(entry_ix)
+            else {
+                return None;
+            };
+            participant_view
+                .read(cx)
+                .thread
+                .read(cx)
+                .linked_session_message(message, thread.session_id())
+        });
+        server_view.update(cx, |view, cx| {
+            view.navigate_to_thread(session_id.clone(), window, cx)
+        });
+        if let Some(participant_view) = participant_view
+            && let Some(linked_entry_ix) = linked_entry_ix
+        {
+            participant_view.update(cx, |view, cx| view.scroll_to_entry(linked_entry_ix, cx));
+        }
+    }
+
     /// How this conversation names another of its sessions, or `None` when it has no thread
     /// for that session.
     pub(super) fn session_participant_label(
@@ -9009,9 +9023,10 @@ impl ThreadView {
         session_id: &acp_v2::SessionId,
         cx: &App,
     ) -> Option<SharedString> {
-        let server_view = self.server_view.upgrade()?;
-        let thread_view = server_view.read(cx).thread_view(session_id)?;
-        let thread = thread_view.read(cx).thread.read(cx);
+        // Read the thread through the conversation rather than its view: an expanded subagent
+        // card renders the subagent's entries while the parent's view is being updated.
+        let conversation = self.conversation.read(cx);
+        let thread = conversation.thread(session_id)?.read(cx);
         Some(if thread.parent_session_id().is_none() {
             "Main Agent".into()
         } else {
@@ -11943,11 +11958,16 @@ impl ThreadView {
                 .and_then(|connected| connected.threads.get(&session_id))
         });
 
+        let state = SubagentCardState::for_subagent_tool_call(
+            tool_call,
+            subagent_thread_view.map(|view| view.read(cx).thread.read(cx)),
+            cx,
+        );
         let content = self.render_subagent_card(
             active_session_id,
             entry_ix,
             &SubagentCardId::ToolCall(tool_call.id.clone()),
-            &SubagentCardState::from_tool_call(tool_call, cx),
+            &state,
             subagent_thread_view,
             focus_handle,
             window,
@@ -12231,9 +12251,12 @@ impl ThreadView {
                     .pending_tool_call(tv_session_id, cx);
 
                 let nav_session_id = tv_session_id.clone();
+                let fullscreen_entry = state.fullscreen_entry();
+                let subagent_view = thread_view.clone();
 
                 let fullscreen_toggle = h_flex()
                     .id(entry_ix)
+                    .debug_selector(move || format!("subagent-fullscreen-{entry_ix}"))
                     .py_1()
                     .w_full()
                     .justify_center()
@@ -12255,6 +12278,9 @@ impl ThreadView {
                                 this.navigate_to_thread(nav_session_id.clone(), window, cx);
                             })
                             .ok();
+                        if let Some(entry_ix) = fullscreen_entry {
+                            subagent_view.update(cx, |view, cx| view.scroll_to_entry(entry_ix, cx));
+                        }
                     }));
 
                 if is_running && let Some((_, subagent_tool_call_id, _)) = pending_tool_call {
@@ -14035,7 +14061,7 @@ pub(crate) fn open_link(
                                     .into_iter()
                                     .flatten()
                                     .filter_map(move |path| {
-                                        path_style.join_path_preserving_components(root, path).ok()
+                                        (!path_style.has_root(path)).then(|| path_style.join(root, path))
                                     })
                                 })
                                 .collect::<Vec<_>>()
@@ -14301,8 +14327,8 @@ fn leading_native_command(
     let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let name = &rest[..name_end];
     let is_native = available_commands.iter().any(|command| {
-        command.name == name
-            && acp_thread::command_category_from_meta(&command.meta)
+        command.name() == name
+            && acp_thread::command_category_from_meta(command.meta())
                 == Some(acp_thread::CommandCategory::Native)
     });
     is_native.then(|| name.to_string())
@@ -14384,14 +14410,14 @@ mod tests {
     }
 
     fn native_command(name: &str) -> acp_v2::AvailableCommand {
-        acp_v2::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
-            acp_thread::CommandCategory::Native,
+        acp_v2::AvailableCommand::Command(acp_v2::Command::new(name, "").meta(
+            acp_thread::meta_with_command_category(acp_thread::CommandCategory::Native),
         ))
     }
 
     fn mcp_command(name: &str) -> acp_v2::AvailableCommand {
-        acp_v2::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
-            acp_thread::CommandCategory::Mcp,
+        acp_v2::AvailableCommand::Command(acp_v2::Command::new(name, "").meta(
+            acp_thread::meta_with_command_category(acp_thread::CommandCategory::Mcp),
         ))
     }
 

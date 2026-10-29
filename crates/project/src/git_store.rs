@@ -89,7 +89,7 @@ use task::Shell;
 use text::{Bias, BufferId, OffsetRangeExt, Rope, ToOffset};
 use util::{
     ResultExt, debug_panic,
-    paths::{PathStyle, SanitizedPath, normalize_path},
+    paths::{PathStyle, SanitizedPath},
     post_inc,
     rel_path::RelPath,
 };
@@ -6139,11 +6139,10 @@ impl RepositorySnapshot {
 
     /// The path that anchors a linked worktree's location: the main worktree
     /// when one exists, otherwise the repository's identity path (relevant for
-    /// bare repositories), falling back to the common Git directory.
-    fn linked_worktree_anchor_path(&self) -> &Path {
+    /// bare repositories).
+    pub fn linked_worktree_anchor_path(&self) -> &Path {
         self.main_worktree_abs_path()
-            .or_else(|| repo_identity_path_if_local(&self.common_dir_abs_path, self.path_style))
-            .unwrap_or(self.common_dir_abs_path.as_ref())
+            .unwrap_or_else(|| repo_identity_path(&self.common_dir_abs_path, self.path_style))
     }
 
     /// Computes the path where a new linked worktree for this repository
@@ -6153,6 +6152,11 @@ impl RepositorySnapshot {
         worktree_name: &str,
         worktree_directory_setting: &str,
     ) -> Result<PathBuf> {
+        anyhow::ensure!(
+            !self.path_style.has_root(Path::new(worktree_name)),
+            "worktree name must not contain a root directory component"
+        );
+
         let repository_anchor = self.linked_worktree_anchor_path();
         let project_name = self
             .path_style
@@ -6163,8 +6167,17 @@ impl RepositorySnapshot {
             worktree_directory_setting,
             self.path_style,
         )?;
-        let directory = self.path_style.join_path(&directory, worktree_name)?;
-        self.path_style.join_path(&directory, project_name)
+        let worktree_directory = self
+            .path_style
+            .normalize_lexically(self.path_style.join(&directory, worktree_name));
+
+        anyhow::ensure!(
+            self.path_style.starts_with(&worktree_directory, &directory),
+            "Worktree name {worktree_name:?} resolves to {worktree_directory:?}, \
+             which is outside the configured worktree directory {directory:?}"
+        );
+
+        Ok(self.path_style.join(&worktree_directory, project_name))
     }
 
     /// The main worktree is the original checkout that other worktrees were
@@ -6216,11 +6229,8 @@ impl RepositorySnapshot {
 
     pub fn repo_path_to_abs_path(&self, repo_path: &RepoPath) -> PathBuf {
         let repo_path = repo_path.display(self.path_style);
-        PathBuf::from(
-            self.path_style
-                .join(&self.work_directory_abs_path, repo_path.as_ref())
-                .unwrap(),
-        )
+        self.path_style
+            .join(&self.work_directory_abs_path, repo_path.as_ref())
     }
 
     #[inline]
@@ -10593,19 +10603,11 @@ pub fn worktrees_directory_for_repo(
         anyhow::bail!("git.worktree_directory must not be \"..\" (use \"../some-name\" instead)");
     }
 
-    let joined = path_style.join_path(repository_anchor_path, trimmed)?;
-    let resolved = if path_style.is_posix() {
-        joined
-    } else {
-        normalize_path(&joined)
-    };
+    let resolved = path_style.normalize_lexically(path_style.join(repository_anchor_path, trimmed));
     let resolved = if path_style.starts_with(resolved.as_path(), repository_anchor_path) {
         resolved
-    } else if let Some(repo_dir_name) = path_style
-        .file_name(repository_anchor_path)
-        .and_then(|name| name.to_str())
-    {
-        path_style.join_path(&resolved, repo_dir_name)?
+    } else if let Some(repo_dir_name) = path_style.file_name(repository_anchor_path) {
+        path_style.normalize_lexically(path_style.join(&resolved, repo_dir_name))
     } else {
         resolved
     };
@@ -10686,14 +10688,6 @@ pub fn repo_identity_path(common_dir: &Path, path_style: PathStyle) -> &Path {
     } else {
         common_dir
     }
-}
-
-/// Returns the repository identity only when `std::path` can interpret the path correctly.
-///
-/// Callers whose downstream path operations are not yet `PathStyle`-aware use this to preserve
-/// their existing behavior for foreign path styles.
-pub fn repo_identity_path_if_local(common_dir: &Path, path_style: PathStyle) -> Option<&Path> {
-    (path_style == PathStyle::local()).then(|| repo_identity_path(common_dir, path_style))
 }
 
 /// Returns true if `git_dir` is a Git submodule's git directory.
@@ -12070,8 +12064,8 @@ mod tests {
         let work_dir = Path::new("/home/user/dev/lsp-tests");
         let directory =
             worktrees_directory_for_repo(work_dir, "../worktrees", PathStyle::Unix).unwrap();
-        let directory = PathStyle::Unix.join_path(&directory, "nimble-sky").unwrap();
-        let path = PathStyle::Unix.join_path(&directory, "lsp-tests").unwrap();
+        let directory = PathStyle::Unix.join(&directory, "nimble-sky");
+        let path = PathStyle::Unix.join(&directory, "lsp-tests");
 
         assert_eq!(
             path,
@@ -12124,6 +12118,147 @@ mod tests {
                 .unwrap(),
             PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky\lsp-tests")
         );
+    }
+
+    #[test]
+    fn test_new_worktree_path_rejects_names_outside_worktree_directory() {
+        let unix_snapshot = RepositorySnapshot::empty(
+            RepositoryId(0),
+            Path::new("/home/user/dev/lsp-tests").into(),
+            None,
+            None,
+            None,
+            PathStyle::Unix,
+        );
+
+        let windows_snapshot = RepositorySnapshot::empty(
+            RepositoryId(0),
+            Path::new(r"C:\Users\user\dev\lsp-tests").into(),
+            None,
+            None,
+            None,
+            PathStyle::Windows,
+        );
+
+        for (snapshot, worktree_name) in [
+            (&unix_snapshot, ".."),
+            (&unix_snapshot, "../.."),
+            (&unix_snapshot, "../../test_worktree"),
+            (&unix_snapshot, "feature/../../escaped"),
+            (&windows_snapshot, "D:trial"),
+            (&windows_snapshot, "C:trial"),
+        ] {
+            assert!(
+                snapshot
+                    .path_for_new_linked_worktree(worktree_name, "../worktrees")
+                    .is_err(),
+                "{worktree_name:?} should be rejected"
+            );
+        }
+
+        // Nested names remain valid as long as they resolve inside the directory.
+        assert_eq!(
+            unix_snapshot
+                .path_for_new_linked_worktree("feature/nested", "../worktrees")
+                .unwrap(),
+            PathBuf::from("/home/user/dev/worktrees/lsp-tests/feature/nested/lsp-tests")
+        );
+    }
+
+    #[test]
+    fn test_linked_worktree_anchor_path() {
+        let cases = [
+            // Normal clone (`.git`): the main worktree's checkout is the anchor.
+            (
+                "/worktrees/zed/feature/zed",
+                "/repos/zed/.git/worktrees/feature",
+                "/worktrees/zed/feature/zed/.git",
+                "/repos/zed/.git",
+                PathStyle::Unix,
+                Some("/repos/zed"),
+                "/repos/zed",
+            ),
+            (
+                r"C:\worktrees\zed\feature\zed",
+                r"C:\repos\zed\.git\worktrees\feature",
+                r"C:\worktrees\zed\feature\zed\.git",
+                r"C:\repos\zed\.git",
+                PathStyle::Windows,
+                Some(r"C:\repos\zed"),
+                r"C:\repos\zed",
+            ),
+            // Bare clone stored in `.bare`: there is no main worktree, so the parent
+            // of `.bare` is the anchor.
+            (
+                "/worktrees/zed/plum-warbler/zed",
+                "/repos/zed/.bare/worktrees/plum-warbler",
+                "/worktrees/zed/plum-warbler/zed/.git",
+                "/repos/zed/.bare",
+                PathStyle::Unix,
+                None,
+                "/repos/zed",
+            ),
+            (
+                r"C:\worktrees\zed\plum-warbler\zed",
+                r"C:\repos\zed\.bare\worktrees\plum-warbler",
+                r"C:\worktrees\zed\plum-warbler\zed\.git",
+                r"C:\repos\zed\.bare",
+                PathStyle::Windows,
+                None,
+                r"C:\repos\zed",
+            ),
+            // Bare clone named `repo.git`: there is no main worktree and no parent to
+            // strip, so the common directory itself is the anchor.
+            (
+                "/worktrees/zed.git/plum-warbler/zed.git",
+                "/repos/zed.git/worktrees/plum-warbler",
+                "/worktrees/zed.git/plum-warbler/zed.git/.git",
+                "/repos/zed.git",
+                PathStyle::Unix,
+                None,
+                "/repos/zed.git",
+            ),
+            (
+                r"C:\worktrees\zed.git\plum-warbler\zed.git",
+                r"C:\repos\zed.git\worktrees\plum-warbler",
+                r"C:\worktrees\zed.git\plum-warbler\zed.git\.git",
+                r"C:\repos\zed.git",
+                PathStyle::Windows,
+                None,
+                r"C:\repos\zed.git",
+            ),
+        ];
+
+        for (
+            work_directory,
+            repository_dir,
+            dot_git,
+            common_dir,
+            path_style,
+            expected_main_worktree,
+            expected_anchor,
+        ) in cases
+        {
+            let snapshot = RepositorySnapshot::empty(
+                RepositoryId(0),
+                Path::new(work_directory).into(),
+                Some(Path::new(repository_dir).into()),
+                Some(Path::new(dot_git).into()),
+                Some(Path::new(common_dir).into()),
+                path_style,
+            );
+
+            assert_eq!(
+                snapshot.main_worktree_abs_path(),
+                expected_main_worktree.map(Path::new),
+                "main worktree for {work_directory:?} with {path_style:?}",
+            );
+            assert_eq!(
+                snapshot.linked_worktree_anchor_path(),
+                Path::new(expected_anchor),
+                "anchor for {work_directory:?} with {path_style:?}",
+            );
+        }
     }
 
     fn verify_invariants(repository: &Repository) -> anyhow::Result<()> {
